@@ -1,0 +1,11 @@
+[project]
+name = "romantic-voice-companion"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "cartesia-line",
+    "supermemory-cartesia",
+]
+
+[tool.uv]
+package = false
