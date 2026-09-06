@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0b0c10" />
+  <meta name="theme-color" content="#08090d" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="MAYA" />
   <link rel="manifest" href="/manifest.webmanifest" />
-  <link rel="stylesheet" href="/styles.css" />
-  <title>MAYA</title>
+  <link rel="stylesheet" href="/styles.css?v=2" />
+  <title>MAYA Live</title>
 </head>
 <body>
   <main class="shell">
@@ -17,9 +17,9 @@
       <div class="identity">
         <div class="avatar-wrap">
           <img id="avatar" class="avatar" alt="Nomi avatar" />
-          <span id="presence" class="presence"></span>
+          <span class="presence"></span>
         </div>
-        <div>
+        <div class="identity-copy">
           <div id="name" class="name">MAYA</div>
           <div id="statusText" class="status">Connecting…</div>
         </div>
@@ -29,29 +29,26 @@
 
     <section id="setupNotice" class="notice hidden"></section>
 
-    <section id="messages" class="messages" aria-live="polite">
-      <div class="empty-state">
-        <div class="orb small"></div>
-        <p>Tap the mic and talk normally.</p>
-        <span>Your words go to the selected Nomi's main chat.</span>
+    <section class="stage">
+      <div id="orb" class="orb" data-mode="idle">
+        <div class="orb-core"></div>
+        <div class="ring ring-one"></div>
+        <div class="ring ring-two"></div>
       </div>
+      <div class="live-badge"><span></span> LIVE VOICE</div>
+      <h1 id="liveText">Ready for a live call</h1>
+      <p class="subline">Start once, then just talk. Silence ends your turn automatically.</p>
+      <div id="transcript" class="transcript"></div>
     </section>
 
     <section class="controls">
-      <button id="playButton" class="secondary hidden" type="button">Play reply</button>
-      <button id="micButton" class="mic" type="button" aria-label="Start recording">
-        <span class="mic-icon"></span>
+      <button id="callButton" class="call-button" type="button">
+        <span class="phone-icon">◉</span>
+        <span id="callLabel">Start live call</span>
       </button>
-      <div id="hint" class="hint">Tap to talk</div>
-
-      <form id="textForm" class="composer">
-        <input id="textInput" maxlength="800" autocomplete="off" placeholder="Or type a message…" />
-        <button type="submit" aria-label="Send message">↑</button>
-      </form>
+      <p class="privacy">Mic stays open only while the live call is active.</p>
     </section>
-
-    <audio id="voicePlayer" preload="auto"></audio>
   </main>
-  <script src="/app.js" defer></script>
+  <script src="/app.js?v=2" defer></script>
 </body>
 </html>
