@@ -1,0 +1,9 @@
+{
+  "name": "MAYA — Nomi Voice Companion",
+  "short_name": "MAYA",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#090a0d",
+  "theme_color": "#0b0c10",
+  "description": "Private voice interface for a Nomi companion."
+}
