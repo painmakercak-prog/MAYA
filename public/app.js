@@ -1,64 +1,51 @@
 const $ = (id) => document.getElementById(id);
+
 const els = {
   avatar: $("avatar"),
   name: $("name"),
   status: $("statusText"),
   select: $("nomiSelect"),
-  messages: $("messages"),
   notice: $("setupNotice"),
-  mic: $("micButton"),
-  hint: $("hint"),
-  form: $("textForm"),
-  input: $("textInput"),
-  player: $("voicePlayer"),
-  play: $("playButton"),
+  transcript: $("transcript"),
+  liveText: $("liveText"),
+  call: $("callButton"),
+  callLabel: $("callLabel"),
+  orb: $("orb"),
 };
 
 let nomis = [];
 let selectedNomi = null;
-let recorder = null;
+let socket = null;
 let mediaStream = null;
-let chunks = [];
-let busy = false;
-let pendingAudioUrl = null;
+let audioContext = null;
+let sourceNode = null;
+let workletNode = null;
+let muteNode = null;
+let pendingPcm = [];
+let playbackCursor = 0;
+let playbackNodes = new Set();
+let callActive = false;
+let acceptAudio = false;
 
-function setState(label, hint = label) {
-  els.status.textContent = label;
-  els.hint.textContent = hint;
+function setStatus(text) {
+  els.status.textContent = text;
+  els.liveText.textContent = text;
 }
 
 function showNotice(text) {
-  els.notice.textContent = text;
+  els.notice.textContent = text || "";
   els.notice.classList.toggle("hidden", !text);
 }
 
-function clearEmpty() {
-  const empty = els.messages.querySelector(".empty-state");
-  if (empty) empty.remove();
+function setOrb(mode) {
+  els.orb.dataset.mode = mode;
 }
 
-function addMessage(role, text) {
-  clearEmpty();
-  const bubble = document.createElement("div");
-  bubble.className = `bubble ${role === "user" ? "user" : "nomi"}`;
-  bubble.textContent = text;
-  els.messages.appendChild(bubble);
-  els.messages.scrollTop = els.messages.scrollHeight;
-}
-
-async function jsonFetch(url, options = {}) {
-  const response = await fetch(url, options);
-  const type = response.headers.get("content-type") || "";
-  const body = type.includes("application/json") ? await response.json() : await response.text();
-  if (!response.ok) {
-    const detail = typeof body === "object" ? body.detail ?? body : body;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
-  }
-  return body;
-}
-
-function selectedId() {
-  return selectedNomi?.uuid || null;
+async function jsonFetch(url) {
+  const response = await fetch(url, { cache: "no-store" });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data?.detail || `Request failed (${response.status})`);
+  return data;
 }
 
 function applyNomi(nomi) {
@@ -67,227 +54,275 @@ function applyNomi(nomi) {
   localStorage.setItem("maya-nomi-id", nomi.uuid);
   els.name.textContent = nomi.name;
   els.avatar.src = `/api/nomis/${encodeURIComponent(nomi.uuid)}/avatar`;
-  els.avatar.onerror = () => { els.avatar.removeAttribute("src"); };
-  setState("Ready", "Tap to talk");
 }
 
 async function boot() {
   try {
     const status = await jsonFetch("/api/status");
-    const missing = Object.entries(status.configured).filter(([, ok]) => !ok).map(([name]) => name);
-    if (missing.length) showNotice(`Server setup incomplete: ${missing.join(", ")}. Add the missing Railway environment variables.`);
+    const missing = Object.entries(status.configured)
+      .filter(([, ok]) => !ok)
+      .map(([name]) => name);
+    if (missing.length) showNotice(`Missing server configuration: ${missing.join(", ")}`);
 
     const data = await jsonFetch("/api/nomis");
     nomis = data.nomis || [];
     els.select.innerHTML = "";
-
-    if (!nomis.length) {
-      setState("No Nomis found", "Check the Nomi account tied to this API key");
-      return;
-    }
-
     for (const nomi of nomis) {
       const option = document.createElement("option");
       option.value = nomi.uuid;
       option.textContent = nomi.name;
       els.select.appendChild(option);
     }
+    if (!nomis.length) throw new Error("No Nomis found on this account");
 
     const remembered = localStorage.getItem("maya-nomi-id");
     const initial = nomis.find((n) => n.uuid === remembered) || nomis[0];
     els.select.value = initial.uuid;
     applyNomi(initial);
+    setStatus("Ready for a live call");
   } catch (error) {
     showNotice(error.message);
-    setState("Setup needed", "Add a fresh Nomi API key on the server");
+    setStatus("Setup needed");
   }
 }
 
 els.select.addEventListener("change", () => {
-  const nomi = nomis.find((n) => n.uuid === els.select.value);
-  applyNomi(nomi);
+  if (callActive) return;
+  applyNomi(nomis.find((n) => n.uuid === els.select.value));
 });
 
-function bestMimeType() {
-  const choices = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"];
-  return choices.find((type) => window.MediaRecorder?.isTypeSupported?.(type)) || "";
+function downsampleTo16k(input, inputRate) {
+  if (inputRate === 16000) return input;
+  const ratio = inputRate / 16000;
+  const length = Math.max(1, Math.floor(input.length / ratio));
+  const output = new Float32Array(length);
+  let outputIndex = 0;
+  let inputIndex = 0;
+
+  while (outputIndex < length) {
+    const nextInputIndex = Math.min(input.length, Math.round((outputIndex + 1) * ratio));
+    let sum = 0;
+    let count = 0;
+    for (let i = inputIndex; i < nextInputIndex; i += 1) {
+      sum += input[i];
+      count += 1;
+    }
+    output[outputIndex] = count ? sum / count : 0;
+    outputIndex += 1;
+    inputIndex = nextInputIndex;
+  }
+  return output;
 }
 
-function extensionFor(type) {
-  if (type.includes("mp4")) return "m4a";
-  if (type.includes("webm")) return "webm";
-  return "audio";
+function floatToInt16(floatData) {
+  const out = new Int16Array(floatData.length);
+  for (let i = 0; i < floatData.length; i += 1) {
+    const s = Math.max(-1, Math.min(1, floatData[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+function enqueueCapture(floatData) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  const downsampled = downsampleTo16k(floatData, audioContext.sampleRate);
+  const pcm = floatToInt16(downsampled);
+  for (let i = 0; i < pcm.length; i += 1) pendingPcm.push(pcm[i]);
+
+  while (pendingPcm.length >= 320) {
+    const frame = new Int16Array(320);
+    for (let i = 0; i < 320; i += 1) frame[i] = pendingPcm.shift();
+    socket.send(frame.buffer);
+  }
 }
 
 function stopPlayback() {
-  els.player.pause();
-  els.player.currentTime = 0;
-  els.play.classList.add("hidden");
+  acceptAudio = false;
+  for (const node of playbackNodes) {
+    try { node.stop(); } catch {}
+  }
+  playbackNodes.clear();
+  if (audioContext) playbackCursor = audioContext.currentTime;
 }
 
-async function startRecording() {
-  if (busy || recorder?.state === "recording") return;
-  if (!selectedId()) {
-    showNotice("Choose a Nomi first.");
-    return;
-  }
+function playPcmChunk(buffer) {
+  if (!acceptAudio || !audioContext || !buffer.byteLength) return;
+  const ints = new Int16Array(buffer);
+  const audioBuffer = audioContext.createBuffer(1, ints.length, 24000);
+  const channel = audioBuffer.getChannelData(0);
+  for (let i = 0; i < ints.length; i += 1) channel[i] = ints[i] / 32768;
 
-  stopPlayback();
-  showNotice("");
-
-  try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-    const mimeType = bestMimeType();
-    recorder = mimeType ? new MediaRecorder(mediaStream, { mimeType }) : new MediaRecorder(mediaStream);
-    chunks = [];
-
-    recorder.addEventListener("dataavailable", (event) => {
-      if (event.data?.size) chunks.push(event.data);
-    });
-
-    recorder.addEventListener("stop", async () => {
-      const type = recorder.mimeType || mimeType || "audio/webm";
-      const blob = new Blob(chunks, { type });
-      mediaStream?.getTracks().forEach((track) => track.stop());
-      mediaStream = null;
-      recorder = null;
-      els.mic.classList.remove("recording");
-      els.mic.setAttribute("aria-label", "Start recording");
-      await handleAudio(blob, type);
-    });
-
-    recorder.start();
-    els.mic.classList.add("recording");
-    els.mic.setAttribute("aria-label", "Stop recording");
-    setState("Listening…", "Tap again when you're done");
-  } catch (error) {
-    showNotice(`Microphone error: ${error.message}`);
-    setState("Ready", "Tap to talk");
-  }
+  const node = audioContext.createBufferSource();
+  node.buffer = audioBuffer;
+  node.connect(audioContext.destination);
+  const startAt = Math.max(audioContext.currentTime + 0.025, playbackCursor);
+  node.start(startAt);
+  playbackCursor = startAt + audioBuffer.duration;
+  playbackNodes.add(node);
+  node.onended = () => playbackNodes.delete(node);
 }
 
-function stopRecording() {
-  if (recorder?.state === "recording") recorder.stop();
-}
-
-els.mic.addEventListener("click", () => {
-  if (recorder?.state === "recording") stopRecording();
-  else startRecording();
-});
-
-async function handleAudio(blob, type) {
-  if (!blob.size) {
-    setState("Ready", "Tap to talk");
-    return;
-  }
-  busy = true;
-  els.mic.disabled = true;
-  try {
-    setState("Transcribing…", "Turning your voice into text");
-    const form = new FormData();
-    form.append("audio", blob, `voice.${extensionFor(type)}`);
-    const transcribed = await jsonFetch("/api/transcribe", { method: "POST", body: form });
-    addMessage("user", transcribed.transcript);
-    await sendToNomi(transcribed.transcript);
-  } catch (error) {
-    showNotice(error.message);
-    setState("Ready", "Tap to talk");
-  } finally {
-    busy = false;
-    els.mic.disabled = false;
-  }
-}
-
-async function sendToNomi(text) {
-  if (!selectedId()) throw new Error("No Nomi selected");
-  setState(`${selectedNomi.name} is thinking…`, "Waiting for a reply");
-
-  const data = await jsonFetch("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ nomiId: selectedId(), messageText: text }),
+async function startAudio() {
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
   });
 
-  const reply = data.replyMessage?.text?.trim();
-  if (!reply) throw new Error("Nomi returned an empty reply");
-  addMessage("nomi", reply);
-  await speak(reply);
+  audioContext = new AudioContext({ latencyHint: "interactive" });
+  await audioContext.resume();
+  await audioContext.audioWorklet.addModule("/pcm-worklet.js?v=2");
+
+  sourceNode = audioContext.createMediaStreamSource(mediaStream);
+  workletNode = new AudioWorkletNode(audioContext, "pcm-capture");
+  muteNode = audioContext.createGain();
+  muteNode.gain.value = 0;
+  sourceNode.connect(workletNode);
+  workletNode.connect(muteNode);
+  muteNode.connect(audioContext.destination);
+  workletNode.port.onmessage = (event) => enqueueCapture(event.data);
 }
 
-async function speak(text) {
-  setState("Speaking…", "Playing the reply");
-  els.play.classList.add("hidden");
-
-  const response = await fetch("/api/speak", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
-  });
-
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
-    showNotice(`Reply received, but voice synthesis failed: ${JSON.stringify(body.detail || body)}`);
-    setState("Ready", "Tap to talk");
-    return;
-  }
-
-  const blob = await response.blob();
-  if (pendingAudioUrl) URL.revokeObjectURL(pendingAudioUrl);
-  pendingAudioUrl = URL.createObjectURL(blob);
-  els.player.src = pendingAudioUrl;
-
-  els.player.onended = () => setState("Ready", "Tap to talk");
-  els.player.onerror = () => {
-    els.play.classList.remove("hidden");
-    setState("Reply ready", "Tap Play reply");
-  };
+async function startCall() {
+  if (!selectedNomi || callActive) return;
+  showNotice("");
+  els.call.disabled = true;
 
   try {
-    await els.player.play();
-  } catch {
-    els.play.classList.remove("hidden");
-    setState("Reply ready", "Tap Play reply");
-  }
-}
+    await startAudio();
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    socket = new WebSocket(`${protocol}//${location.host}/ws/live?nomi_id=${encodeURIComponent(selectedNomi.uuid)}`);
+    socket.binaryType = "arraybuffer";
 
-els.play.addEventListener("click", async () => {
-  try {
-    await els.player.play();
-    els.play.classList.add("hidden");
-    setState("Speaking…", "Playing the reply");
+    socket.onopen = () => {
+      callActive = true;
+      els.select.disabled = true;
+      els.call.classList.add("active");
+      els.callLabel.textContent = "End live call";
+      els.call.disabled = false;
+      setOrb("listening");
+      setStatus("Live — just talk");
+    };
+
+    socket.onmessage = (event) => {
+      if (typeof event.data !== "string") {
+        playPcmChunk(event.data);
+        return;
+      }
+
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+
+      switch (message.type) {
+        case "ready":
+          setStatus("Live — just talk");
+          setOrb("listening");
+          break;
+        case "speech_started":
+          setStatus("Listening…");
+          setOrb("hearing");
+          break;
+        case "interim":
+          els.transcript.textContent = message.text || "";
+          break;
+        case "user_final":
+          els.transcript.textContent = message.text || "";
+          setStatus(`${selectedNomi.name} is thinking…`);
+          setOrb("thinking");
+          break;
+        case "thinking":
+          setStatus(`${selectedNomi.name} is thinking…`);
+          setOrb("thinking");
+          break;
+        case "assistant_text":
+          if (!message.interrupted) els.transcript.textContent = message.text || "";
+          break;
+        case "speaking":
+          acceptAudio = true;
+          playbackCursor = audioContext.currentTime + 0.025;
+          setStatus(`${selectedNomi.name} is speaking`);
+          setOrb("speaking");
+          break;
+        case "barge_in":
+          stopPlayback();
+          setStatus("Listening…");
+          setOrb("hearing");
+          break;
+        case "turn_complete":
+          if (!playbackNodes.size) {
+            setStatus("Live — just talk");
+            setOrb("listening");
+          }
+          break;
+        case "error":
+          showNotice(message.message || "Live call error");
+          setStatus("Call error");
+          setOrb("error");
+          break;
+      }
+    };
+
+    socket.onerror = () => {
+      showNotice("The live connection hit an error.");
+    };
+
+    socket.onclose = () => {
+      if (callActive) endCall(false);
+    };
   } catch (error) {
-    showNotice(`Playback error: ${error.message}`);
+    showNotice(`Could not start live audio: ${error.message}`);
+    await endCall(false);
+  } finally {
+    els.call.disabled = false;
   }
+}
+
+async function endCall(sendStop = true) {
+  stopPlayback();
+  if (sendStop && socket?.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "stop" }));
+  }
+  try { socket?.close(); } catch {}
+  socket = null;
+
+  workletNode?.disconnect();
+  sourceNode?.disconnect();
+  muteNode?.disconnect();
+  mediaStream?.getTracks().forEach((track) => track.stop());
+  mediaStream = null;
+  workletNode = null;
+  sourceNode = null;
+  muteNode = null;
+  pendingPcm = [];
+
+  if (audioContext) {
+    try { await audioContext.close(); } catch {}
+  }
+  audioContext = null;
+
+  callActive = false;
+  acceptAudio = false;
+  els.select.disabled = false;
+  els.call.classList.remove("active");
+  els.callLabel.textContent = "Start live call";
+  setOrb("idle");
+  setStatus("Ready for a live call");
+}
+
+els.call.addEventListener("click", async () => {
+  if (callActive) await endCall(true);
+  else await startCall();
 });
 
-els.form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const text = els.input.value.trim();
-  if (!text || busy) return;
-  stopPlayback();
-  showNotice("");
-  busy = true;
-  els.mic.disabled = true;
-  els.input.disabled = true;
-  try {
-    addMessage("user", text);
-    els.input.value = "";
-    await sendToNomi(text);
-  } catch (error) {
-    showNotice(error.message);
-    setState("Ready", "Tap to talk");
-  } finally {
-    busy = false;
-    els.mic.disabled = false;
-    els.input.disabled = false;
-    els.input.focus();
-  }
+window.addEventListener("beforeunload", () => {
+  if (socket?.readyState === WebSocket.OPEN) socket.close();
 });
 
 if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js?v=2").catch(() => {}));
 }
 
 boot();
