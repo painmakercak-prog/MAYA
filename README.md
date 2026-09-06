@@ -1,113 +1,89 @@
-# Romantic Voice Companion
+# MAYA — Nomi Voice Companion
 
-A clean Cartesia Line + LLM + Supermemory starter repo for an ongoing romantic voice companion.
+This branch replaces the custom LLM + Supermemory brain with your existing **Nomi** as the conversational brain.
 
 ## Architecture
 
-- **Cartesia Line**: realtime voice pipeline
-- **LLM**: live conversation/personality
-- **Supermemory**: lived relationship history across calls
-- **Cartesia Knowledge Base (optional, configured in Cartesia UI)**: stable character/world facts
+**iPhone microphone → Deepgram Nova-3 → Nomi main chat → Cartesia Sonic → iPhone audio**
 
-The important separation is:
+The browser never receives any provider API key. All secrets stay on the server.
 
-- **Prompt** = how the companion behaves and speaks
-- **Knowledge Base** = durable canon
-- **Supermemory** = what actually happened between you
-- **Current call** = what is happening right now
+### What Nomi owns
 
-Do not use the Knowledge Base as a transcript dump.
+- personality
+- relationship state
+- Nomi's existing main-chat continuity
+- whatever memory/context Nomi already uses for that Nomi
 
-## Files
+### What this app owns
 
-- `main.py` — voice agent + LLM + Supermemory wiring
-- `companion_prompt.txt` — voice-first romantic personality prompt
-- `.env.example` — required secrets/config
-- `pyproject.toml` — dependencies
+- iPhone/PWA interface
+- microphone capture
+- speech-to-text through Deepgram
+- sending the transcript to the selected Nomi
+- text-to-speech through Cartesia
+- playback and session transcript UI
 
-## Required secrets
+There is no second LLM and no Supermemory layer in this version.
 
-Set these in the same place you currently set deployment secrets:
+## Before you deploy
 
-- `CARTESIA_API_KEY`
-- `LLM_API_KEY`
-- `SUPERMEMORY_API_KEY`
+The Nomi key that was visible in the screenshot should be considered exposed. Delete it in Nomi and create a fresh one. Put the fresh key only in Railway/environment secrets.
 
-Optional:
+## Required environment variables
 
-- `LLM_MODEL`
-- `COMPANION_NAME`
-- `USER_NAME`
-- `MEMORY_CONTAINER_TAG`
-- `MEMORY_SEARCH_LIMIT`
-- `MEMORY_SEARCH_THRESHOLD`
-- `INTRODUCTION`
+```text
+NOMI_API_KEY=...
+DEEPGRAM_API_KEY=...
+CARTESIA_API_KEY=...
+CARTESIA_VOICE_ID=...
+```
 
-Never commit real API keys.
+Recommended defaults are already in `.env.example`:
 
-## Model switching
+```text
+DEEPGRAM_MODEL=nova-3
+DEEPGRAM_LANGUAGE=en
+CARTESIA_MODEL_ID=sonic-3.6
+CARTESIA_VERSION=2026-08-14
+```
 
-The repo defaults to:
+## Run locally
 
-`anthropic/claude-haiku-4-5-20251001`
+```bash
+cp .env.example .env
+# fill in the real secrets
+pip install -e .
+python main.py
+```
 
-That is intentional for low-latency voice.
+Open `http://localhost:8000`.
 
-To A/B test another model, change only `LLM_MODEL` and `LLM_API_KEY` in deployment secrets. Do not rewrite the prompt at the same time or you will not know which change affected the result.
+## Railway
 
-## Memory
+This branch includes `railway.json` with the FastAPI start command and `/healthz` health check.
 
-This repo uses Supermemory `mode="full"`.
+1. Deploy the `nomi-voice-companion` branch.
+2. Add the four required environment variables above in Railway Variables.
+3. Open the generated HTTPS domain on iPhone.
+4. In Safari, use **Add to Home Screen** for the standalone companion experience.
 
-`custom_id` is the Cartesia call ID, so each call is grouped as its own memory document.
+HTTPS is required for microphone access outside localhost.
 
-`MEMORY_CONTAINER_TAG` should remain stable across calls for the same relationship so relevant history can be retrieved later.
+## How the app behaves
 
-## Cartesia Knowledge Base
+- On load it asks the Nomi API for the Nomis on your account.
+- Select a Nomi; the app proxies that Nomi's avatar without exposing the Nomi API key.
+- Tap the microphone, talk, then tap again.
+- The recorded clip goes to Deepgram Nova-3.
+- The transcript is posted to `POST /v1/nomis/:id/chat`, which is the Nomi's main chat.
+- The Nomi reply is sent to Cartesia Sonic and played back.
+- You can also type instead of speaking.
 
-If you use Cartesia's Knowledge Base, put only stable information there, for example:
+## Privacy boundaries
 
-- character background
-- long-term preferences
-- stable relationships
-- world/location facts
-- recurring people
-- fixed boundaries
+Voice clips are sent to Deepgram for transcription. Nomi receives the transcript. Cartesia receives the Nomi reply text for speech synthesis. This app sets Deepgram's `mip_opt_out=true` on transcription requests.
 
-Do **not** put changing relationship state, arguments, promises, running jokes, or call history there. Those belong in Supermemory.
+## Current tradeoff
 
-## First test
-
-Do not test with trivia.
-
-Use normal conversation:
-
-- "What are you doing?"
-- "I bought something stupid."
-- "Did you miss me?"
-- "You're getting on my nerves."
-- "I had a terrible day."
-- "Whatever, forget it."
-- "I can't sleep."
-
-Listen for:
-
-- short natural reactions
-- actual opinions
-- variation in response length
-- teasing without constant flirting
-- affection without constant reassurance
-- no automatic follow-up question
-- memory appearing only when relevant
-- no assistant/customer-service phrasing
-
-## Tuning order
-
-Change one thing at a time:
-
-1. Test the default prompt + model.
-2. A/B test the model.
-3. Tune memory retrieval only if recall is poor.
-4. Add stable Knowledge Base material only after the voice/personality feels right.
-
-Do not pile more rules into the prompt every time a single response is bad. Social examples usually teach the desired voice better than another page of prohibitions.
+This first version is **turn-based push-to-talk**, not a full-duplex always-listening call. That choice makes it dependable on iPhone Safari and keeps provider keys server-side. The next upgrade is streaming STT + interruption/barge-in once this end-to-end path is verified.
