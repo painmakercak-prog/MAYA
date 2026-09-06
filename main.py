@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import urllib.parse
 import uuid
@@ -21,7 +22,10 @@ NOMI_BASE_URL = "https://api.nomi.ai/v1"
 DEEPGRAM_WS_URL = "wss://api.deepgram.com/v2/listen"
 CARTESIA_WS_URL = "wss://api.cartesia.ai/tts/websocket"
 
-logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger("maya.live")\n\napp = FastAPI(title="MAYA — Live Nomi Voice", version="3.0.0")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("maya.live")
+
+app = FastAPI(title="MAYA — Live Nomi Voice", version="3.0.0")
 
 
 def env(name: str, default: str | None = None) -> str:
