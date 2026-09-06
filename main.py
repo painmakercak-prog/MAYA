@@ -198,7 +198,7 @@ async def live_voice(ws: WebSocket) -> None:
         "sample_rate": "16000",
         "channels": "1",
         "interim_results": "true",
-        "endpointing": env("ENDPOINTING_MS", "500"),
+        "endpointing": env("ENDPOINTING_MS", "300"),
         "utterance_end_ms": env("UTTERANCE_END_MS", "1000"),
         "vad_events": "true",
         "smart_format": "true",
@@ -257,6 +257,11 @@ async def live_voice(ws: WebSocket) -> None:
                     continue
 
                 if event_type == "UtteranceEnd":
+                    utterance = " ".join(final_parts).strip()
+                    final_parts.clear()
+                    if utterance:
+                        await send_json_safe(ws, {"type": "user_final", "text": utterance})
+                        await utterance_queue.put(utterance)
                     continue
 
                 if event_type != "Results":
@@ -271,8 +276,12 @@ async def live_voice(ws: WebSocket) -> None:
                     preview = " ".join(final_parts + [transcript]).strip()
                     await send_json_safe(ws, {"type": "interim", "text": preview})
 
-                if transcript and is_final:
-                    final_parts.append(transcript)
+                if transcript and (is_final or speech_final):
+                    # Deepgram may mark speech_final before is_final. Treat the
+                    # endpoint transcript itself as authoritative so short iPhone
+                    # utterances are never dropped.
+                    if not final_parts or final_parts[-1] != transcript:
+                        final_parts.append(transcript)
 
                 if speech_final:
                     utterance = " ".join(final_parts).strip()
