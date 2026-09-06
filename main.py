@@ -18,10 +18,10 @@ BASE_DIR = Path(__file__).resolve().parent
 PUBLIC_DIR = BASE_DIR / "public"
 
 NOMI_BASE_URL = "https://api.nomi.ai/v1"
-DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen"
+DEEPGRAM_WS_URL = "wss://api.deepgram.com/v2/listen"
 CARTESIA_WS_URL = "wss://api.cartesia.ai/tts/websocket"
 
-app = FastAPI(title="MAYA — Live Nomi Voice", version="2.0.0")
+logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger("maya.live")\n\napp = FastAPI(title="MAYA — Live Nomi Voice", version="3.0.0")
 
 
 def env(name: str, default: str | None = None) -> str:
@@ -52,7 +52,7 @@ async def status() -> dict[str, Any]:
             "cartesiaVoice": bool(os.getenv("CARTESIA_VOICE_ID", "").strip()),
         },
         "models": {
-            "stt": os.getenv("DEEPGRAM_MODEL", "nova-3"),
+            "stt": os.getenv("DEEPGRAM_MODEL", "flux-general-en"),
             "tts": os.getenv("CARTESIA_MODEL_ID", "sonic-3.6"),
         },
     }
@@ -192,17 +192,11 @@ async def live_voice(ws: WebSocket) -> None:
         return
 
     dg_params = {
-        "model": env("DEEPGRAM_MODEL", "nova-3"),
-        "language": env("DEEPGRAM_LANGUAGE", "en-US"),
+        "model": env("DEEPGRAM_MODEL", "flux-general-en"),
         "encoding": "linear16",
         "sample_rate": "16000",
-        "channels": "1",
-        "interim_results": "true",
-        "endpointing": env("ENDPOINTING_MS", "300"),
-        "utterance_end_ms": env("UTTERANCE_END_MS", "1000"),
-        "vad_events": "true",
-        "smart_format": "true",
-        "punctuate": "true",
+        "eot_threshold": env("DEEPGRAM_EOT_THRESHOLD", "0.55"),
+        "eot_timeout_ms": env("DEEPGRAM_EOT_TIMEOUT_MS", "1400"),
         "mip_opt_out": "true",
     }
     dg_uri = f"{DEEPGRAM_WS_URL}?{urllib.parse.urlencode(dg_params)}"
@@ -214,6 +208,9 @@ async def live_voice(ws: WebSocket) -> None:
     closed = asyncio.Event()
 
     async def client_audio_sender(dg_ws: Any) -> None:
+        frame_count = 0
+        byte_count = 0
+        announced_audio = False
         try:
             while not closed.is_set():
                 message = await ws.receive()
@@ -221,7 +218,13 @@ async def live_voice(ws: WebSocket) -> None:
                     break
                 audio = message.get("bytes")
                 if audio:
+                    frame_count += 1
+                    byte_count += len(audio)
                     await dg_ws.send(audio)
+                    if not announced_audio and byte_count >= 2560:
+                        announced_audio = True
+                        logger.info("live audio flowing: nomi=%s frames=%s bytes=%s", nomi_id, frame_count, byte_count)
+                        await send_json_safe(ws, {"type": "audio_received"})
                 text = message.get("text")
                 if text:
                     try:
@@ -232,7 +235,11 @@ async def live_voice(ws: WebSocket) -> None:
                         break
         except WebSocketDisconnect:
             pass
+        except Exception:
+            logger.exception("client audio sender failed for nomi=%s", nomi_id)
+            raise
         finally:
+            logger.info("live socket closing: nomi=%s frames=%s bytes=%s", nomi_id, frame_count, byte_count)
             closed.set()
             try:
                 await dg_ws.send(json.dumps({"type": "CloseStream"}))
@@ -246,49 +253,63 @@ async def live_voice(ws: WebSocket) -> None:
                     break
                 if isinstance(raw, bytes):
                     continue
+
                 event = json.loads(raw)
                 event_type = event.get("type")
+                turn_event = event.get("event")
 
-                if event_type == "SpeechStarted":
+                if event_type == "Connected":
+                    logger.info("Deepgram Flux connected: nomi=%s request=%s", nomi_id, event.get("request_id"))
+                    await send_json_safe(ws, {"type": "stt_ready"})
+                    continue
+
+                if event_type == "Error":
+                    description = event.get("description") or event.get("code") or "Deepgram Flux error"
+                    logger.error("Deepgram Flux error for nomi=%s: %s", nomi_id, description)
+                    await send_json_safe(ws, {"type": "error", "message": f"Speech service: {description}"})
+                    closed.set()
+                    break
+
+                if event_type != "TurnInfo":
+                    continue
+
+                transcript = (event.get("transcript") or "").strip()
+
+                if turn_event == "StartOfTurn":
+                    logger.info("speech start: nomi=%s", nomi_id)
                     if turn_busy[0]:
                         interruption_token[0] += 1
                         await send_json_safe(ws, {"type": "barge_in"})
                     await send_json_safe(ws, {"type": "speech_started"})
                     continue
 
-                if event_type == "UtteranceEnd":
-                    utterance = " ".join(final_parts).strip()
-                    final_parts.clear()
-                    if utterance:
-                        await send_json_safe(ws, {"type": "user_final", "text": utterance})
-                        await utterance_queue.put(utterance)
+                if turn_event in ("Update", "EagerEndOfTurn") and transcript:
+                    await send_json_safe(ws, {"type": "interim", "text": transcript})
                     continue
 
-                if event_type != "Results":
+                if turn_event == "TurnResumed":
+                    if turn_busy[0]:
+                        interruption_token[0] += 1
+                        await send_json_safe(ws, {"type": "barge_in"})
+                    await send_json_safe(ws, {"type": "speech_started"})
                     continue
 
-                alt = (event.get("channel", {}).get("alternatives") or [{}])[0]
-                transcript = (alt.get("transcript") or "").strip()
-                is_final = bool(event.get("is_final"))
-                speech_final = bool(event.get("speech_final"))
-
-                if transcript and not is_final:
-                    preview = " ".join(final_parts + [transcript]).strip()
-                    await send_json_safe(ws, {"type": "interim", "text": preview})
-
-                if transcript and (is_final or speech_final):
-                    # Deepgram may mark speech_final before is_final. Treat the
-                    # endpoint transcript itself as authoritative so short iPhone
-                    # utterances are never dropped.
-                    if not final_parts or final_parts[-1] != transcript:
-                        final_parts.append(transcript)
-
-                if speech_final:
-                    utterance = " ".join(final_parts).strip()
-                    final_parts.clear()
-                    if utterance:
-                        await send_json_safe(ws, {"type": "user_final", "text": utterance})
-                        await utterance_queue.put(utterance)
+                if turn_event == "EndOfTurn":
+                    logger.info(
+                        "end of turn: nomi=%s transcript_chars=%s trigger=%s confidence=%s",
+                        nomi_id,
+                        len(transcript),
+                        event.get("trigger"),
+                        event.get("end_of_turn_confidence"),
+                    )
+                    if transcript:
+                        await send_json_safe(ws, {"type": "user_final", "text": transcript})
+                        await utterance_queue.put(transcript)
+                    else:
+                        await send_json_safe(ws, {"type": "error", "message": "I heard audio but couldn't transcribe that turn."})
+        except Exception:
+            logger.exception("Deepgram receiver failed for nomi=%s", nomi_id)
+            raise
         finally:
             closed.set()
 
