@@ -174,12 +174,31 @@ async function startAudio() {
 
   audioContext = new AudioContext({ latencyHint: "interactive" });
   await audioContext.resume();
-  await audioContext.audioWorklet.addModule("/pcm-worklet.js?v=2");
-
   sourceNode = audioContext.createMediaStreamSource(mediaStream);
+
+  const isiOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+  // iOS Safari has been inconsistent about keeping zero-gain AudioWorklets
+  // actively pulled. ScriptProcessor is deprecated, but remains extremely
+  // reliable on iPhone and gives us continuous PCM for this live call.
+  if (isiOS && audioContext.createScriptProcessor) {
+    captureMode = "script-processor";
+    scriptNode = audioContext.createScriptProcessor(2048, 1, 1);
+    scriptNode.onaudioprocess = (event) => {
+      const input = event.inputBuffer.getChannelData(0);
+      enqueueCapture(new Float32Array(input));
+      // Leave output buffer untouched: it stays silent while keeping the graph active.
+    };
+    sourceNode.connect(scriptNode);
+    scriptNode.connect(audioContext.destination);
+    return;
+  }
+
+  captureMode = "audio-worklet";
+  await audioContext.audioWorklet.addModule("/pcm-worklet.js?v=3");
   workletNode = new AudioWorkletNode(audioContext, "pcm-capture");
   muteNode = audioContext.createGain();
-  muteNode.gain.value = 0;
+  muteNode.gain.value = 0.000001;
   sourceNode.connect(workletNode);
   workletNode.connect(muteNode);
   muteNode.connect(audioContext.destination);
@@ -218,8 +237,17 @@ async function startCall() {
 
       switch (message.type) {
         case "ready":
+          setStatus("Connecting speech…");
+          setOrb("listening");
+          break;
+        case "stt_ready":
           setStatus("Live — just talk");
           setOrb("listening");
+          break;
+        case "audio_received":
+          if (els.status.textContent === "Connecting speech…" || els.status.textContent === "Live — just talk") {
+            setStatus("Live — mic connected");
+          }
           break;
         case "speech_started":
           setStatus("Listening…");
@@ -289,13 +317,19 @@ async function endCall(sendStop = true) {
   socket = null;
 
   workletNode?.disconnect();
+  if (scriptNode) {
+    scriptNode.onaudioprocess = null;
+    scriptNode.disconnect();
+  }
   sourceNode?.disconnect();
   muteNode?.disconnect();
   mediaStream?.getTracks().forEach((track) => track.stop());
   mediaStream = null;
   workletNode = null;
+  scriptNode = null;
   sourceNode = null;
   muteNode = null;
+  captureMode = null;
   pendingPcm = [];
 
   if (audioContext) {
@@ -322,7 +356,7 @@ window.addEventListener("beforeunload", () => {
 });
 
 if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js?v=2").catch(() => {}));
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js?v=3").catch(() => {}));
 }
 
 boot();
