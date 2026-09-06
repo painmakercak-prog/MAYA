@@ -1,5 +1,5 @@
-const CACHE = "maya-live-v2";
-const STATIC = ["/", "/styles.css?v=2", "/app.js?v=2", "/pcm-worklet.js?v=2", "/manifest.webmanifest"];
+const CACHE = "maya-live-v3";
+const STATIC = ["/", "/styles.css?v=3", "/app.js?v=3", "/pcm-worklet.js?v=3", "/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(STATIC)));
